@@ -1,0 +1,9 @@
+{
+  "routerUrl": "Your router url, by default it's http://192.168.1.1",
+  "username": "your_router_username",
+  "password": "your_router_password",
+  "providerNumber": "telephone number of your provider",
+  "providerSmsText": "text you're looking for",
+  "replySmsText": "text you want to send",
+  "frequency_minutes": 5
+}
