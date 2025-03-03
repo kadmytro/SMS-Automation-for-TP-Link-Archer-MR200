@@ -6,7 +6,7 @@ const LOGIN_INPUT = "#pc-login-password";
 const LOGIN_BUTTON = "#pc-login-btn";
 const ALERT_CONTAINER = "#alert-container";
 const CONFIRM_YES = "#confirm-yes";
-const ADVANCED_BUTTON = "#advanced .T_adv.text";
+const ADVANCED_BUTTON = "#advanced";
 const SMS_BUTTON = '#menuTree li.ml1 a[url="lteSmsInbox.htm"]';
 const INBOX_BUTTON = '#menuTree li.ml2 a[url="lteSmsInbox.htm"]';
 const INBOX_BODY = "#tableSmsInboxBody";
@@ -45,6 +45,35 @@ function validateConfig(config) {
   }
 }
 
+async function clickAndCheckClass(page, selector, targetClass, maxRetries = 3) {
+  let retries = 0;
+  while (retries < maxRetries) {
+    try {
+      await page.click(selector);
+      await new Promise((resolve) => setTimeout(resolve, 500)); // Wait for the class to be applied
+
+      const hasClass = await page.$eval(
+        selector,
+        (el, targetClass) => el.classList.contains(targetClass),
+        targetClass
+      );
+
+      if (hasClass) {
+        return true; // Class found, operation successful
+      } else {
+        console.warn(
+          `Class "${targetClass}" not found after click. Retrying...`
+        );
+        retries++;
+      }
+    } catch (error) {
+      console.error(`Error during click or class check: ${error}`);
+      retries++;
+    }
+  }
+  return false; // Max retries reached, class not found
+}
+
 async function automateSms() {
   const browser = await puppeteer.launch({ headless: true });
 
@@ -72,12 +101,24 @@ async function automateSms() {
 
     // 4. Click on "Advanced"
     await page.waitForSelector(ADVANCED_BUTTON, { timeout: 20000 });
-    await page.click(ADVANCED_BUTTON);
+    const advanced = await clickAndCheckClass(
+      page,
+      ADVANCED_BUTTON,
+      "selected"
+    );
+    if (!advanced) {
+      console.error("Failed to go to advanced.");
+      return;
+    }
     await new Promise((resolve) => setTimeout(resolve, 1000));
 
     // 5. Click on "SMS"
     await page.waitForSelector(SMS_BUTTON, { timeout: 20000 });
-    await page.click(SMS_BUTTON);
+    const smsSelected = await clickAndCheckClass(page, SMS_BUTTON, "clicked");
+    if (!smsSelected) {
+      console.error("Failed to go to select sms");
+      return;
+    }
     await new Promise((resolve) => setTimeout(resolve, 1000));
 
     // 6. Click on "Inbox"

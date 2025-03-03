@@ -1,6 +1,6 @@
 {
   "name": "sms-automation-tp-link-mr200",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Automates SMS sending on a TP-Link Archer MR200 router",
   "main": "index.js",
   "scripts": {
