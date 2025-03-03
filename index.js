@@ -29,7 +29,7 @@ function validateConfig(config) {
 }
 
 async function automateSms() {
-  const browser = await puppeteer.launch({ headless: true });
+  const browser = await puppeteer.launch({ headless: false });
 
   const page = await browser.newPage();
 
@@ -48,12 +48,12 @@ async function automateSms() {
       const confirmButton = await page.$("#confirm-yes");
       if (confirmButton) {
         await confirmButton.click();
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await page.waitForSelector("#ul-nav", { timeout: 10000 });
       } else {
         console.error("Confirm button not found in alert dialog.");
       }
     } else {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await page.waitForSelector("#ul-nav", { timeout: 10000 });
     }
 
     // 4. Click on "Advanced"
@@ -102,9 +102,9 @@ async function automateSms() {
         // 12. Click Send
         await page.click("#send");
         await new Promise((resolve) => setTimeout(resolve, 3000));
-        console.log("sent message to o2");
+        console.log("SMS successfully sent to provider");
       } else {
-        console.log("no need to send message to o2");
+        console.log("no need to send SMS to provider");
       }
     } else {
       console.log("No messages in inbox");
