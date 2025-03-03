@@ -69,14 +69,35 @@ This Node.js project automates SMS sending on a TP-Link Archer MR200 router usin
     sudo apt install nodejs npm
     ```
 
-3.  Install Puppeteer:
+3.  Install Chromium and its dependencies:
+
+    ```bash
+    sudo apt install chromium-browser chromium-codecs-ffmpeg
+    ```
+
+4.  Install Puppeteer:
 
     ```bash
     npm install puppeteer
     ```
 
-4.  Run the script using Node.js.
-5.  **Running as a Service (Recommended):**
+5.  **Modify Puppeteer Launch Options:**
+
+    * In your `index.js` file, modify the Puppeteer launch options as follows:
+
+        ```javascript
+        const browser = await puppeteer.launch({
+            headless: true,
+            executablePath: '/usr/bin/chromium-browser',
+            args: ['--no-sandbox', '--disable-setuid-sandbox']
+        });
+        ```
+
+        * This configures Puppeteer to use the system's Chromium browser and disables sandbox restrictions (which are often necessary on Raspberry Pi).
+
+6.  Run the script using Node.js.
+
+7.  **Running as a Service (Recommended):**
 
     * To ensure the script runs continuously and restarts automatically if it crashes, use a service manager like Systemd (Linux) or PM2 (cross-platform).
 
@@ -95,6 +116,7 @@ This Node.js project automates SMS sending on a TP-Link Archer MR200 router usin
             WorkingDirectory=/path/to/your/sms-automation
             ExecStart=/usr/bin/node index.js
             Restart=always
+            Environment="DISPLAY=:0"
 
             [Install]
             WantedBy=multi-user.target
@@ -132,7 +154,6 @@ This Node.js project automates SMS sending on a TP-Link Archer MR200 router usin
         * PM2 will automatically restart the script if it crashes.
 
     * **Note:** Your script already handles the execution frequency internally. Therefore, you do not need to use cron for scheduling.
-
 ## Code Structure
 
 - `index.js`: The main script that automates SMS sending.
