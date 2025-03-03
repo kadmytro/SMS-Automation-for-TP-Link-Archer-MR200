@@ -1,5 +1,6 @@
 const puppeteer = require("puppeteer");
 const fs = require("fs");
+const { time } = require("console");
 
 const config = JSON.parse(fs.readFileSync("config.json", "utf8"));
 const LOGIN_INPUT = "#pc-login-password";
@@ -47,9 +48,14 @@ function validateConfig(config) {
 
 async function clickAndCheckClass(page, selector, targetClass, maxRetries = 3) {
   let retries = 0;
+  const element = await waitForElementOrNull(page, selector);
+
+  if (!element) {
+    throw new Error(`Element not found: ${selector}`);
+  }
   while (retries < maxRetries) {
     try {
-      await page.click(selector);
+      await element.click();
       await new Promise((resolve) => setTimeout(resolve, 500)); // Wait for the class to be applied
 
       const hasClass = await page.$eval(
@@ -74,6 +80,47 @@ async function clickAndCheckClass(page, selector, targetClass, maxRetries = 3) {
   return false; // Max retries reached, class not found
 }
 
+async function waitForElementOrNull(
+  page,
+  selector,
+  timeout = 20000,
+  ignoreErrors = false
+) {
+  try {
+    const element = await page.waitForSelector(selector, {
+      visible: true,
+      enabled: true,
+      timeout: timeout,
+    });
+    return element; // Element found
+  } catch (waitForSelectorError) {
+    if (waitForSelectorError.message.includes("Waiting failed:")) {
+      if (!ignoreErrors) {
+        console.warn(`Element not found within timeout: ${selector}`);
+      }
+      return null; // Element not found within timeout
+    } else {
+      if (!ignoreErrors) {
+        console.error(
+          `Error waiting for element: ${selector}`,
+          waitForSelectorError
+        );
+      }
+      return null; // Other error during waiting
+    }
+  }
+}
+
+async function clickElement(page, selector) {
+  const element = await waitForElementOrNull(page, selector);
+
+  if (element) {
+    await element.click();
+  } else {
+    throw new Error(`Element not found: ${selector}`);
+  }
+}
+
 async function automateSms() {
   const browser = await puppeteer.launch({ headless: true });
 
@@ -89,23 +136,24 @@ async function automateSms() {
     // 3. Click login button
     await page.click(LOGIN_BUTTON);
     await new Promise((resolve) => setTimeout(resolve, 1000));
-    const alertContainer = await page.$(ALERT_CONTAINER, { timeout: 20000 });
+    const alertContainer = await waitForElementOrNull(
+      page,
+      ALERT_CONTAINER,
+      1000,
+      true
+    );
+
     if (alertContainer) {
-      const confirmButton = await page.$(CONFIRM_YES);
-      if (confirmButton) {
-        await confirmButton.click();
-      } else {
-        console.error("Confirm button not found in alert dialog.");
-      }
+      await clickElement(page, CONFIRM_YES);
     }
 
     // 4. Click on "Advanced"
-    await page.waitForSelector(ADVANCED_BUTTON, { timeout: 20000 });
     const advanced = await clickAndCheckClass(
       page,
       ADVANCED_BUTTON,
       "selected"
     );
+
     if (!advanced) {
       console.error("Failed to go to advanced.");
       return;
@@ -113,7 +161,6 @@ async function automateSms() {
     await new Promise((resolve) => setTimeout(resolve, 1000));
 
     // 5. Click on "SMS"
-    await page.waitForSelector(SMS_BUTTON, { timeout: 20000 });
     const smsSelected = await clickAndCheckClass(page, SMS_BUTTON, "clicked");
     if (!smsSelected) {
       console.error("Failed to go to select sms");
@@ -122,24 +169,25 @@ async function automateSms() {
     await new Promise((resolve) => setTimeout(resolve, 1000));
 
     // 6. Click on "Inbox"
-    await page.waitForSelector(INBOX_BUTTON, { timeout: 20000 });
-    await page.click(INBOX_BUTTON);
+    await clickElement(page, INBOX_BUTTON);
     await new Promise((resolve) => setTimeout(resolve, 1000));
 
     // 7. Wait for messages to load
-    await page.waitForSelector(INBOX_BODY, { timeout: 20000 });
+    await waitForElementOrNull(page, INBOX_BODY);
 
     // 8. Click on the first message's edit icon
-    await page.waitForSelector(EDIT_LAST_SMS_BUTTON, { timeout: 20000 });
-    const firstRowEditButton = await page.$(EDIT_LAST_SMS_BUTTON);
+    const firstRowEditButton = await waitForElementOrNull(
+      page,
+      EDIT_LAST_SMS_BUTTON
+    );
 
     if (firstRowEditButton) {
       await firstRowEditButton.click();
       await new Promise((resolve) => setTimeout(resolve, 1000));
 
       // 9. Check number and content
-      await page.waitForSelector(PHONE_NUMBER, { timeout: 20000 });
-      await page.waitForSelector(MESSAGE_CONTENT, { timeout: 20000 });
+      await waitForElementOrNull(page, PHONE_NUMBER);
+      await waitForElementOrNull(page, MESSAGE_CONTENT);
       const phoneNumber = await page.$eval(PHONE_NUMBER, (el) =>
         el.textContent.trim()
       );
@@ -152,18 +200,15 @@ async function automateSms() {
         messageContent.includes(config.providerSmsText)
       ) {
         // 10. Click Reply
-        await page.waitForSelector(REPLY_BUTTON, { timeout: 20000 });
-        await page.click(REPLY_BUTTON);
+        await clickElement(page, REPLY_BUTTON);
         await new Promise((resolve) => setTimeout(resolve, 1000));
 
         // 11. Input reply text
-        await page.waitForSelector(REPLY_TEXT_INPUT, { timeout: 20000 });
+        await waitForElementOrNull(page, REPLY_TEXT_INPUT);
         await page.type(REPLY_TEXT_INPUT, config.replySmsText);
 
         // 12. Click Send
-
-        await page.waitForSelector(SEND_BUTTON, { timeout: 20000 });
-        await page.click(SEND_BUTTON);
+        await clickElement(page, SEND_BUTTON);
         await new Promise((resolve) => setTimeout(resolve, 1000));
         console.log("SMS successfully sent to provider");
       } else {
@@ -174,22 +219,18 @@ async function automateSms() {
     }
 
     // 13. Logout
-    await page.waitForSelector(LOGOUT_BUTTON, { timeout: 20000 });
-    await page.click(LOGOUT_BUTTON);
+    await clickElement(page, LOGOUT_BUTTON);
     await new Promise((resolve) => setTimeout(resolve, 1000));
-    await page.waitForSelector(LOGOUT_CONFIRM, { timeout: 20000 });
-    await page.click(LOGOUT_CONFIRM);
+    await clickElement(page, LOGOUT_CONFIRM);
 
     //14. Wait a few seconds.
     await new Promise((resolve) => setTimeout(resolve, 3000));
   } catch (error) {
     console.error("Automation error:", error);
     try {
-      await page.waitForSelector(LOGOUT_BUTTON, { timeout: 20000 });
-      await page.click(LOGOUT_BUTTON);
+      await clickElement(page, LOGOUT_BUTTON);
       await new Promise((resolve) => setTimeout(resolve, 1000));
-      await page.waitForSelector(LOGOUT_CONFIRM, { timeout: 20000 });
-      await page.click(LOGOUT_CONFIRM);
+      await clickElement(page, LOGOUT_CONFIRM);
     } catch (logoutError) {
       console.error("Logout failed:", logoutError);
     }
