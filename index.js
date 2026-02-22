@@ -1,4 +1,5 @@
 const puppeteer = require("puppeteer");
+const https = require("https");
 const fs = require("fs");
 const { time } = require("console");
 
@@ -9,17 +10,35 @@ const ALERT_CONTAINER = "#alert-container";
 const CONFIRM_YES = "#confirm-yes";
 const ADVANCED_BUTTON = "#advanced";
 const SMS_BUTTON = '#menuTree li.ml1 a[url="lteSmsInbox.htm"]';
-const INBOX_BUTTON = '#menuTree li.ml2 a[url="lteSmsInbox.htm"]';
-const INBOX_BODY = "#tableSmsInboxBody";
-const EDIT_LAST_SMS_BUTTON =
-  "#tableSmsInboxBody tr:first-child .edit-modify-icon";
-const PHONE_NUMBER = "#phoneNumber";
-const MESSAGE_CONTENT = "#msgContent";
-const REPLY_BUTTON = "#reply";
-const REPLY_TEXT_INPUT = "#inputContent";
+const NEW_MESSAGE_BUTTON = '#menuTree li.ml2 a[url="lteSmsNewMsg.htm"]';
+const PHONE_NUMBER_INPUT = "#toNumber";
+const REBOOT_BUTTON = "#topReboot";
+const MESSAGE_INPUT = "#inputContent";
 const SEND_BUTTON = "#send";
 const LOGOUT_BUTTON = "#topLogout";
-const LOGOUT_CONFIRM = "#alert-container button.btn-msg-ok";
+const ALERT_CONFIRM = "#alert-container button.btn-msg-ok";
+const TIMEOUT_MS = 8000;
+const HEADLESS = true;
+
+let testInterval = null;
+let intervalPaused = false;
+
+function pauseInterval() {
+  if (testInterval) {
+    clearInterval(testInterval);
+    testInterval = null;
+    intervalPaused = true;
+  }
+}
+
+function resumeInterval() {
+  if (!testInterval && intervalPaused) {
+    testInterval = setInterval(connectionDaemon, config.frequency_minutes * 60 * 1000);
+    intervalPaused = false;
+  }
+}
+
+// ================= HELPER FUNCTIONS =================
 
 function validateConfig(config) {
   const requiredFields = [
@@ -27,9 +46,10 @@ function validateConfig(config) {
     "username",
     "password",
     "providerNumber",
-    "providerSmsText",
-    "replySmsText",
+    "smsText",
     "frequency_minutes",
+    "speed_threshold_MBps",
+    "speed_test_url",
   ];
 
   for (const field of requiredFields) {
@@ -38,10 +58,7 @@ function validateConfig(config) {
     }
   }
 
-  if (
-    typeof config.frequency_minutes !== "number" ||
-    config.frequency_minutes <= 0
-  ) {
+  if (typeof config.frequency_minutes !== "number" || config.frequency_minutes <= 0) {
     throw new Error("Frequency must be a positive number.");
   }
 }
@@ -58,18 +75,12 @@ async function clickAndCheckClass(page, selector, targetClass, maxRetries = 3) {
       await element.click();
       await new Promise((resolve) => setTimeout(resolve, 500)); // Wait for the class to be applied
 
-      const hasClass = await page.$eval(
-        selector,
-        (el, targetClass) => el.classList.contains(targetClass),
-        targetClass
-      );
+      const hasClass = await page.$eval(selector, (el, targetClass) => el.classList.contains(targetClass), targetClass);
 
       if (hasClass) {
         return true; // Class found, operation successful
       } else {
-        console.warn(
-          `Class "${targetClass}" not found after click. Retrying...`
-        );
+        console.warn(`Class "${targetClass}" not found after click. Retrying...`);
         retries++;
       }
     } catch (error) {
@@ -80,12 +91,7 @@ async function clickAndCheckClass(page, selector, targetClass, maxRetries = 3) {
   return false; // Max retries reached, class not found
 }
 
-async function waitForElementOrNull(
-  page,
-  selector,
-  timeout = 20000,
-  ignoreErrors = false
-) {
+async function waitForElementOrNull(page, selector, timeout = 20000, ignoreErrors = false) {
   try {
     const element = await page.waitForSelector(selector, {
       visible: true,
@@ -101,10 +107,7 @@ async function waitForElementOrNull(
       return null; // Element not found within timeout
     } else {
       if (!ignoreErrors) {
-        console.error(
-          `Error waiting for element: ${selector}`,
-          waitForSelectorError
-        );
+        console.error(`Error waiting for element: ${selector}`, waitForSelectorError);
       }
       return null; // Other error during waiting
     }
@@ -121,130 +124,207 @@ async function clickElement(page, selector) {
   }
 }
 
-async function automateSms() {
-  const browser = await puppeteer.launch({ headless: true });
+// ================= SPEED TEST =================
+function testSpeed() {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    let bytes = 0;
+
+    https
+      .get(config.speed_test_url, { timeout: TIMEOUT_MS }, (res) => {
+        res.on("data", (chunk) => (bytes += chunk.length));
+        res.on("end", () => {
+          const duration = (Date.now() - start) / 1000;
+          const speedMBps = bytes / 1024 / 1024 / duration;
+          resolve(speedMBps);
+        });
+      })
+      .on("error", () => resolve(0));
+  });
+}
+
+// ================= LOGIN =================
+async function login(page) {
+  // 1. Go to routerUrl
+  await page.goto(config.routerUrl);
+
+  // 2. Input password
+  await page.type(LOGIN_INPUT, config.password);
+
+  // 3. Click login button
+  await page.click(LOGIN_BUTTON);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  const alertContainer = await waitForElementOrNull(page, ALERT_CONTAINER, 1000, true);
+
+  if (alertContainer) {
+    await clickElement(page, CONFIRM_YES);
+  }
+}
+
+// ================= LOGOUT =================
+async function logout(page) {
+  await clickElement(page, LOGOUT_BUTTON);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  await clickElement(page, ALERT_CONFIRM);
+
+  // Wait a few seconds.
+  await new Promise((resolve) => setTimeout(resolve, 3000));
+}
+
+// ================= REBOOT FUNCTION =================
+async function rebootRouter() {
+  const browser = await puppeteer.launch({ headless: HEADLESS });
 
   const page = await browser.newPage();
-
+  let errorMessage = null;
   try {
-    // 1. Go to routerUrl
-    await page.goto(config.routerUrl);
+    // 1. Login
+    await login(page);
 
-    // 2. Input password
-    await page.type(LOGIN_INPUT, config.password);
-
-    // 3. Click login button
-    await page.click(LOGIN_BUTTON);
+    // 2. Reboot router
+    await clickElement(page, REBOOT_BUTTON);
     await new Promise((resolve) => setTimeout(resolve, 1000));
-    const alertContainer = await waitForElementOrNull(
-      page,
-      ALERT_CONTAINER,
-      1000,
-      true
-    );
+    await clickElement(page, ALERT_CONFIRM);
 
-    if (alertContainer) {
-      await clickElement(page, CONFIRM_YES);
-    }
+    // 3. Wait a minute .
+    await new Promise((resolve) => setTimeout(resolve, 90_000));
 
-    // 4. Click on "Advanced"
-    const advanced = await clickAndCheckClass(
-      page,
-      ADVANCED_BUTTON,
-      "selected"
-    );
-
-    if (!advanced) {
-      console.error("Failed to go to advanced.");
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-
-    // 5. Click on "SMS"
-    const smsSelected = await clickAndCheckClass(page, SMS_BUTTON, "clicked");
-    if (!smsSelected) {
-      console.error("Failed to go to select sms");
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-
-    // 6. Click on "Inbox"
-    await clickElement(page, INBOX_BUTTON);
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-
-    // 7. Wait for messages to load
-    await waitForElementOrNull(page, INBOX_BODY);
-
-    // 8. Click on the first message's edit icon
-    const firstRowEditButton = await waitForElementOrNull(
-      page,
-      EDIT_LAST_SMS_BUTTON
-    );
-
-    if (firstRowEditButton) {
-      await firstRowEditButton.click();
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-
-      // 9. Check number and content
-      await waitForElementOrNull(page, PHONE_NUMBER);
-      await waitForElementOrNull(page, MESSAGE_CONTENT);
-      const phoneNumber = await page.$eval(PHONE_NUMBER, (el) =>
-        el.textContent.trim()
-      );
-      const messageContent = await page.$eval(MESSAGE_CONTENT, (el) =>
-        el.textContent.trim()
-      );
-
-      if (
-        phoneNumber === config.providerNumber &&
-        messageContent.includes(config.providerSmsText)
-      ) {
-        // 10. Click Reply
-        await clickElement(page, REPLY_BUTTON);
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-
-        // 11. Input reply text
-        await waitForElementOrNull(page, REPLY_TEXT_INPUT);
-        await page.type(REPLY_TEXT_INPUT, config.replySmsText);
-
-        // 12. Click Send
-        await clickElement(page, SEND_BUTTON);
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        console.log("SMS successfully sent to provider");
-      } else {
-        console.log("no need to send SMS to provider");
-      }
-    } else {
-      console.log("No messages in inbox");
-    }
-
-    // 13. Logout
-    await clickElement(page, LOGOUT_BUTTON);
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    await clickElement(page, LOGOUT_CONFIRM);
-
-    //14. Wait a few seconds.
-    await new Promise((resolve) => setTimeout(resolve, 3000));
+    await logout(page);
   } catch (error) {
-    console.error("Automation error:", error);
+    errorMessage = error;
+    console.error("Reboot error:", error);
     try {
-      await clickElement(page, LOGOUT_BUTTON);
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      await clickElement(page, LOGOUT_CONFIRM);
+      await logout(page);
     } catch (logoutError) {
       console.error("Logout failed:", logoutError);
     }
   } finally {
     await browser.close();
+    return errorMessage;
   }
 }
 
-try {
-  const config = JSON.parse(fs.readFileSync("config.json", "utf8"));
-  validateConfig(config);
+// ================= MAIN =================
+async function connectionDaemon() {
+  console.log("Running connection check...");
 
-  automateSms();
-  setInterval(automateSms, config.frequency_minutes * 60 * 1000);
-} catch (error) {
-  console.error("Error:", error.message);
+  // 1) Test speed
+  const speed = await testSpeed();
+  console.log(`Speed: ${speed.toFixed(2)} MB/s`);
+
+  if (speed >= config.speed_threshold_MBps) {
+    console.log("Connection OK\n");
+    return;
+  }
+
+  console.log("Throttling detected");
+
+  // 2) Send sms to provbider
+  await sendSmsToProvider();
+
+  console.log("Waiting for ISP processing...");
+  await new Promise((resolve) => setTimeout(resolve, 90_000));
+
+  // 4) Re-test speed
+  const newSpeed = await testSpeed();
+  console.log(`New speed: ${newSpeed.toFixed(2)} MB/s`);
+
+  // 4) Reboot if needed
+  if (newSpeed < config.speed_threshold_MBps) {
+    console.log("Still throttled → rebooting router");
+    await rebootRouter();
+  } else {
+    console.log("Connection restored by SMS");
+  }
 }
+
+async function sendSmsToProvider() {
+  const browser = await puppeteer.launch({ headless: HEADLESS });
+
+  const page = await browser.newPage();
+  let errorMessage = null;
+
+  try {
+    // 1. Login
+    await login(page);
+
+    // 2. Click on "Advanced"
+    const advanced = await clickAndCheckClass(page, ADVANCED_BUTTON, "selected");
+
+    if (!advanced) {
+      errorMessage = "Failed to go to advanced.";
+      console.error(errorMessage);
+      return errorMessage;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    // 3. Click on "SMS"
+    const smsSelected = await clickAndCheckClass(page, SMS_BUTTON, "clicked");
+    if (!smsSelected) {
+      errorMessage = "Failed to go to select sms";
+      console.error(errorMessage);
+      return errorMessage;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    // 4. Click on "New Message"
+    await clickElement(page, NEW_MESSAGE_BUTTON);
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    // 5. Input provider number
+    await waitForElementOrNull(page, PHONE_NUMBER_INPUT);
+    await page.type(PHONE_NUMBER_INPUT, config.providerNumber);
+
+    // 6. Input message text
+    await waitForElementOrNull(page, MESSAGE_INPUT);
+    await page.type(MESSAGE_INPUT, config.replySmsText);
+
+    // 7. send the sms
+    await clickElement(page, SEND_BUTTON);
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    console.log("SMS successfully sent to provider");
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    // 8. Logout
+    await logout(page);
+  } catch (error) {
+    errorMessage = error;
+    console.error("Automation error:", error);
+    try {
+      await logout(page);
+    } catch (logoutError) {
+      console.error("Logout failed:", logoutError);
+    }
+  } finally {
+    await browser.close();
+    return errorMessage;
+  }
+}
+
+async function start() {
+  try {
+    const config = JSON.parse(fs.readFileSync("config.json", "utf8"));
+    validateConfig(config);
+
+    if (require.main === module) {
+      validateConfig(config);
+      await connectionDaemon();
+      testInterval = setInterval(connectionDaemon, config.frequency_minutes * 60 * 1000);
+    }
+  } catch (error) {
+    console.error("Error:", error.message);
+  }
+}
+
+start();
+
+module.exports = {
+  automateSms: login,
+  logout,
+  rebootRouter,
+  connectionDaemon,
+  sendSmsToProvider,
+  pauseInterval,
+  resumeInterval,
+};

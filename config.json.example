@@ -3,7 +3,8 @@
   "username": "your_router_username",
   "password": "your_router_password",
   "providerNumber": "telephone number of your provider",
-  "providerSmsText": "text you're looking for",
-  "replySmsText": "text you want to send",
-  "frequency_minutes": 5
+  "smsText": "text you want to send",
+  "frequency_minutes": 5,
+  "speed_threshold_MBps": "speed threshold",
+  "speed_test_url": "url of the service to download a test file to check the speed"
 }
