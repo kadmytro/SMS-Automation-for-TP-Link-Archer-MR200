@@ -18,6 +18,7 @@ const SEND_BUTTON = "#send";
 const LOGOUT_BUTTON = "#topLogout";
 const ALERT_CONFIRM = "#alert-container button.btn-msg-ok";
 const TIMEOUT_MS = 8000;
+const MAX_ATTEMPTS = 3;
 const HEADLESS = true;
 
 let testInterval = null;
@@ -39,6 +40,18 @@ function resumeInterval() {
 }
 
 // ================= HELPER FUNCTIONS =================
+
+async function getBrowser() {
+  //  // for Raspberry Pi (ARM)
+  // const browser = await puppeteer.launch({
+  //   headless: true,
+  //   executablePath: "/usr/bin/chromium",
+  // });
+
+  const browser = await puppeteer.launch({ headless: HEADLESS });
+
+  return browser;
+}
 
 function validateConfig(config) {
   const requiredFields = [
@@ -125,21 +138,59 @@ async function clickElement(page, selector) {
 }
 
 // ================= SPEED TEST =================
-function testSpeed() {
+
+async function testSpeed() {
+  let failures = 0;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const speed = await singleSpeedTest();
+
+    console.log(`Speed attempt ${attempt}: ${speed.toFixed(2)} MB/s`);
+
+    if (speed >= config.speed_threshold_MBps) {
+      // Success → return immediately
+      return speed;
+    }
+
+    failures++;
+
+    // Small delay between attempts to avoid burst bias
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+
+  // If we reach here → 3 consecutive failures
+  return 0;
+}
+
+function singleSpeedTest() {
   return new Promise((resolve) => {
     const start = Date.now();
     let bytes = 0;
+    let finished = false;
 
-    https
-      .get(config.speed_test_url, { timeout: TIMEOUT_MS }, (res) => {
-        res.on("data", (chunk) => (bytes += chunk.length));
-        res.on("end", () => {
-          const duration = (Date.now() - start) / 1000;
-          const speedMBps = bytes / 1024 / 1024 / duration;
-          resolve(speedMBps);
-        });
-      })
-      .on("error", () => resolve(0));
+    const req = https.get(config.speed_test_url, { timeout: TIMEOUT_MS }, (res) => {
+      res.on("data", (chunk) => (bytes += chunk.length));
+
+      res.on("end", () => {
+        if (finished) return;
+        finished = true;
+
+        const duration = (Date.now() - start) / 1000;
+        if (duration <= 0) return resolve(0);
+
+        const speedMBps = bytes / 1024 / 1024 / duration;
+        resolve(speedMBps);
+      });
+    });
+
+    req.on("timeout", () => {
+      req.destroy();
+      if (!finished) resolve(0);
+    });
+
+    req.on("error", () => {
+      if (!finished) resolve(0);
+    });
   });
 }
 
@@ -173,7 +224,7 @@ async function logout(page) {
 
 // ================= REBOOT FUNCTION =================
 async function rebootRouter() {
-  const browser = await puppeteer.launch({ headless: HEADLESS });
+  const browser = await getBrowser();
 
   const page = await browser.newPage();
   let errorMessage = null;
@@ -186,8 +237,8 @@ async function rebootRouter() {
     await new Promise((resolve) => setTimeout(resolve, 1000));
     await clickElement(page, ALERT_CONFIRM);
 
-    // 3. Wait a minute .
-    await new Promise((resolve) => setTimeout(resolve, 90_000));
+    // 3. Wait some time .
+    await new Promise((resolve) => setTimeout(resolve, 120000));
 
     await logout(page);
   } catch (error) {
@@ -223,7 +274,7 @@ async function connectionDaemon() {
   await sendSmsToProvider();
 
   console.log("Waiting for ISP processing...");
-  await new Promise((resolve) => setTimeout(resolve, 90_000));
+  await new Promise((resolve) => setTimeout(resolve, 90000));
 
   // 4) Re-test speed
   const newSpeed = await testSpeed();
@@ -239,7 +290,7 @@ async function connectionDaemon() {
 }
 
 async function sendSmsToProvider() {
-  const browser = await puppeteer.launch({ headless: HEADLESS });
+  const browser = await getBrowser();
 
   const page = await browser.newPage();
   let errorMessage = null;
@@ -278,7 +329,7 @@ async function sendSmsToProvider() {
 
     // 6. Input message text
     await waitForElementOrNull(page, MESSAGE_INPUT);
-    await page.type(MESSAGE_INPUT, config.replySmsText);
+    await page.type(MESSAGE_INPUT, config.smsText);
 
     // 7. send the sms
     await clickElement(page, SEND_BUTTON);
