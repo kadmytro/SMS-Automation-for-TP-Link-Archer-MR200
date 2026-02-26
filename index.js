@@ -20,26 +20,17 @@ const ALERT_CONFIRM = "#alert-container button.btn-msg-ok";
 const TIMEOUT_MS = 8000;
 const MAX_ATTEMPTS = 3;
 const HEADLESS = true;
-
-let testInterval = null;
-let intervalPaused = false;
-
-function pauseInterval() {
-  if (testInterval) {
-    clearInterval(testInterval);
-    testInterval = null;
-    intervalPaused = true;
-  }
-}
-
-function resumeInterval() {
-  if (!testInterval && intervalPaused) {
-    testInterval = setInterval(connectionDaemon, config.frequency_minutes * 60 * 1000);
-    intervalPaused = false;
-  }
-}
+const netState = {
+  throttled: false,
+  smsAttempts: 0,
+  locked: false,
+};
 
 // ================= HELPER FUNCTIONS =================
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 async function getBrowser() {
   //  // for Raspberry Pi (ARM)
@@ -62,7 +53,7 @@ function validateConfig(config) {
     "smsText",
     "frequency_minutes",
     "speed_threshold_MBps",
-    "speed_test_url",
+    "speed_endpoints",
   ];
 
   for (const field of requiredFields) {
@@ -71,8 +62,39 @@ function validateConfig(config) {
     }
   }
 
+  // frequency
   if (typeof config.frequency_minutes !== "number" || config.frequency_minutes <= 0) {
-    throw new Error("Frequency must be a positive number.");
+    throw new Error("frequency_minutes must be a positive number");
+  }
+
+  // threshold
+  if (typeof config.speed_threshold_MBps !== "number" || config.speed_threshold_MBps <= 0) {
+    throw new Error("speed_threshold_MBps must be a positive number");
+  }
+
+  // endpoints
+  if (!Array.isArray(config.speed_endpoints)) {
+    throw new Error("speed_endpoints must be an array");
+  }
+
+  if (config.speed_endpoints.length === 0) {
+    throw new Error("speed_endpoints must contain at least one endpoint");
+  }
+
+  for (const url of config.speed_endpoints) {
+    if (typeof url !== "string") {
+      throw new Error("All speed_endpoints must be strings");
+    }
+
+    if (!url.startsWith("https://")) {
+      throw new Error(`Endpoint must use HTTPS: ${url}`);
+    }
+
+    try {
+      new URL(url);
+    } catch {
+      throw new Error(`Invalid URL in speed_endpoints: ${url}`);
+    }
   }
 }
 
@@ -139,36 +161,28 @@ async function clickElement(page, selector) {
 
 // ================= SPEED TEST =================
 
-async function testSpeed() {
-  let failures = 0;
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const speed = await singleSpeedTest();
-
-    console.log(`Speed attempt ${attempt}: ${speed.toFixed(2)} MB/s`);
+async function checkInternetUsable() {
+  for (const url of config.speed_endpoints) {
+    const speed = await singleSpeedTest(url, TIMEOUT_MS);
+    console.log(`Endpoint ${url} → ${speed.toFixed(2)} MB/s`);
 
     if (speed >= config.speed_threshold_MBps) {
-      // Success → return immediately
-      return speed;
+      return true; // internet usable
     }
 
-    failures++;
-
-    // Small delay between attempts to avoid burst bias
-    await new Promise((r) => setTimeout(r, 2000));
+    await sleep(10000);
   }
 
-  // If we reach here → 3 consecutive failures
-  return 0;
+  return false; // all endpoints slow/unusable
 }
 
-function singleSpeedTest() {
+function singleSpeedTest(url, timeoutMs = TIMEOUT_MS) {
   return new Promise((resolve) => {
     const start = Date.now();
     let bytes = 0;
     let finished = false;
 
-    const req = https.get(config.speed_test_url, { timeout: TIMEOUT_MS }, (res) => {
+    const req = https.get(url, { timeout: timeoutMs }, (res) => {
       res.on("data", (chunk) => (bytes += chunk.length));
 
       res.on("end", () => {
@@ -256,36 +270,85 @@ async function rebootRouter() {
 }
 
 // ================= MAIN =================
+
+async function daemonLoop() {
+  while (true) {
+    try {
+      await connectionDaemon();
+    } catch (err) {
+      console.error("Daemon error:", err);
+    }
+
+    // wait AFTER completion
+    await sleep(config.frequency_minutes * 60 * 1000);
+  }
+}
+
 async function connectionDaemon() {
   console.log("Running connection check...");
 
-  // 1) Test speed
-  const speed = await testSpeed();
-  console.log(`Speed: ${speed.toFixed(2)} MB/s`);
+  const usable = await checkInternetUsable();
 
-  if (speed >= config.speed_threshold_MBps) {
-    console.log("Connection OK\n");
+  // ===========================
+  // INTERNET OK
+  // ===========================
+  if (usable) {
+    if (netState.throttled) {
+      console.log("Internet restored → resetting state");
+    }
+
+    netState.throttled = false;
+    netState.smsAttempts = 0;
+    netState.locked = false;
     return;
   }
 
-  console.log("Throttling detected");
+  // ===========================
+  // INTERNET UNUSABLE
+  // ===========================
+  console.log("Internet unusable (likely throttled)");
 
-  // 2) Send sms to provbider
+  // If already locked → do nothing, just monitor
+  if (netState.locked) {
+    console.log("State locked → monitoring only");
+    return;
+  }
+
+  netState.throttled = true;
+
+  // Safety limit
+  if (netState.smsAttempts >= MAX_ATTEMPTS) {
+    console.log("Max SMS attempts reached → locking state until internet returns");
+    netState.locked = true;
+    return;
+  }
+
+  // Try recovery
+  console.log("Sending SMS to provider...");
   await sendSmsToProvider();
+  netState.smsAttempts++;
 
   console.log("Waiting for ISP processing...");
-  await new Promise((resolve) => setTimeout(resolve, 90000));
+  await sleep(90000); // 90s
 
-  // 4) Re-test speed
-  const newSpeed = await testSpeed();
-  console.log(`New speed: ${newSpeed.toFixed(2)} MB/s`);
+  // Recheck
+  const recovered = await checkInternetUsable();
 
-  // 4) Reboot if needed
-  if (newSpeed < config.speed_threshold_MBps) {
-    console.log("Still throttled → rebooting router");
+  if (recovered) {
+    console.log("Internet restored by SMS");
+    netState.throttled = false;
+    netState.smsAttempts = 0;
+    netState.locked = false;
+    return;
+  }
+
+  // Not recovered
+  console.log("Still unusable");
+
+  // Optional reboot attempt only if not locked
+  if (netState.smsAttempts < 3) {
+    console.log("Rebooting router...");
     await rebootRouter();
-  } else {
-    console.log("Connection restored by SMS");
   }
 }
 
@@ -353,22 +416,7 @@ async function sendSmsToProvider() {
   }
 }
 
-async function start() {
-  try {
-    const config = JSON.parse(fs.readFileSync("config.json", "utf8"));
-    validateConfig(config);
-
-    if (require.main === module) {
-      validateConfig(config);
-      await connectionDaemon();
-      testInterval = setInterval(connectionDaemon, config.frequency_minutes * 60 * 1000);
-    }
-  } catch (error) {
-    console.error("Error:", error.message);
-  }
-}
-
-start();
+daemonLoop();
 
 module.exports = {
   automateSms: login,
@@ -376,6 +424,4 @@ module.exports = {
   rebootRouter,
   connectionDaemon,
   sendSmsToProvider,
-  pauseInterval,
-  resumeInterval,
 };

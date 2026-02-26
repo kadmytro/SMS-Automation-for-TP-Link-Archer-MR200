@@ -6,5 +6,6 @@
   "smsText": "text you want to send",
   "frequency_minutes": 5,
   "speed_threshold_MBps": "speed threshold",
-  "speed_test_url": "url of the service to download a test file to check the speed"
+  "speed_test_url": "url of the service to download a test file to check the speed",
+  "speed_endpoints": ["ENDPOINT_1", "ENDPOINT_2"]
 }
